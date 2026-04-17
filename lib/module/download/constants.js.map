@@ -1,0 +1,1 @@
+{"version":3,"names":["RELEASE_API_BASE","CACHE_TTL_MINUTES","MODEL_ARCHIVE_EXT","MODEL_ONNX_EXT"],"sourceRoot":"../../../src","sources":["download/constants.ts"],"mappings":";;AAAA,OAAO,MAAMA,gBAAgB,GAC3B,+DAA+D;AACjE,OAAO,MAAMC,iBAAiB,GAAG,EAAE,GAAG,EAAE;AACxC,OAAO,MAAMC,iBAAiB,GAAG,UAAU;AAC3C,OAAO,MAAMC,cAAc,GAAG,OAAO","ignoreList":[]}

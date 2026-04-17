@@ -1,0 +1,1382 @@
+package com.sherpaonnx
+
+import android.net.Uri
+import com.facebook.react.bridge.ReactApplicationContext
+import com.facebook.react.bridge.Promise
+import com.facebook.react.bridge.ReadableArray
+import com.facebook.react.bridge.ReadableMap
+import com.facebook.react.bridge.Arguments
+import com.facebook.react.module.annotations.ReactModule
+import com.facebook.react.modules.core.DeviceEventManagerModule
+import com.k2fsa.sherpa.onnx.WaveReader
+
+@ReactModule(name = SherpaOnnxModule.NAME)
+class SherpaOnnxModule(reactContext: ReactApplicationContext) :
+  NativeSherpaOnnxSpec(reactContext) {
+
+  init {
+    // Load onnxruntime first so libsherpa-onnx-jni.so can resolve OrtGetApiBase.
+    // When the app adds com.xdcobra.sherpa:onnxruntime and uses pickFirst, this loads the AAR's version.
+    try {
+      System.loadLibrary("onnxruntime")
+    } catch (e: UnsatisfiedLinkError) {
+      android.util.Log.w(NAME, "onnxruntime not loaded (will use SDK copy if present): ${e.message}")
+    }
+    // Load sherpa-onnx JNI (from AAR; required for Kotlin API: OfflineRecognizer, OfflineTts, etc.)
+    try {
+      System.loadLibrary("sherpa-onnx-jni")
+    } catch (e: UnsatisfiedLinkError) {
+      throw RuntimeException("Failed to load sherpa-onnx-jni (from sherpa-onnx AAR): ${e.message}", e)
+    }
+    // Load sherpa-onnx C-API (from AAR; needed at runtime only if Zipvoice TTS is used).
+    // Non-fatal: if the .so is missing, Zipvoice init will fail with a clear error later.
+    try {
+      System.loadLibrary("sherpa-onnx-c-api")
+    } catch (e: UnsatisfiedLinkError) {
+      android.util.Log.w("SherpaOnnx", "sherpa-onnx-c-api not available — Zipvoice TTS will not work: ${e.message}")
+    }
+    // Then load our library (Archive, FFmpeg, model detection, Zipvoice JNI wrapper)
+    System.loadLibrary("sherpaonnx")
+    instance = this
+  }
+
+  private val assetHelper = SherpaOnnxAssetHelper(reactApplicationContext, NAME)
+  private val sttHelper = SherpaOnnxSttHelper(
+    reactApplicationContext,
+    { modelDir, preferInt8, hasPreferInt8, modelType, debug ->
+      Companion.nativeDetectSttModel(modelDir, preferInt8, hasPreferInt8, modelType, debug)
+    },
+    NAME
+  )
+  private val onlineSttHelper = SherpaOnnxOnlineSttHelper(reactApplicationContext, NAME)
+  private val ttsHelper = SherpaOnnxTtsHelper(
+    reactApplicationContext,
+    { modelDir, modelType -> Companion.nativeDetectTtsModel(modelDir, modelType) },
+    { instanceId, requestId, samples, sampleRate, progress, isFinal -> emitTtsStreamChunk(instanceId, requestId, samples, sampleRate, progress, isFinal) },
+    { instanceId, requestId, message -> emitTtsStreamError(instanceId, requestId, message) },
+    { instanceId, requestId, cancelled -> emitTtsStreamEnd(instanceId, requestId, cancelled) }
+  )
+  private val enhancementHelper = SherpaOnnxEnhancementHelper(
+    reactApplicationContext,
+    { modelDir, modelType -> Companion.nativeDetectEnhancementModel(modelDir, modelType) }
+  )
+  private val archiveHelper = SherpaOnnxArchiveHelper()
+  private var pcmCapture: SherpaOnnxPcmCapture? = null
+
+  override fun getName(): String {
+    return NAME
+  }
+
+  override fun onCatalystInstanceDestroy() {
+    super.onCatalystInstanceDestroy()
+    pcmCapture?.stop()
+    pcmCapture = null
+    onlineSttHelper.shutdown()
+    ttsHelper.shutdown()
+    enhancementHelper.shutdown()
+  }
+
+  /**
+   * Test method to verify sherpa-onnx native library is loaded.
+   * This is a minimal "Hello World" test for Phase 1.
+   */
+  override fun testSherpaInit(promise: Promise) {
+    try {
+      val result = nativeTestSherpaInit()
+      promise.resolve(result)
+    } catch (e: Exception) {
+      android.util.Log.e(NAME, "INIT_ERROR: Failed to test sherpa-onnx initialization", e)
+      promise.reject("INIT_ERROR", "Failed to test sherpa-onnx initialization", e)
+    }
+  }
+
+  /** Asset path for embedded QNN test model (ORT testdata: qnn_multi_ctx_embed). */
+  private val qnnTestModelAsset = "testModels/qnn_multi_ctx_embed.onnx"
+
+  /**
+   * QNN support (AccelerationSupport): providerCompiled, hasAccelerator (native HTP init), canInit (session test).
+   * If modelBase64 is not provided, uses embedded test model from assets for canInit (same pattern as NNAPI/XNNPACK).
+   */
+  override fun getQnnSupport(modelBase64: String?, promise: Promise) {
+    try {
+      val providers = ai.onnxruntime.OrtEnvironment.getAvailableProviders()
+      val providerCompiled = providers.any { it.name.contains("QNN", ignoreCase = true) }
+      val hasAccelerator = try { nativeCanInitQnnHtp() } catch (_: Exception) { false }
+      val modelSource = if (!modelBase64.isNullOrEmpty()) "user-provided modelBase64" else "embedded test model"
+      val modelBytes = when {
+        !modelBase64.isNullOrEmpty() -> try {
+          android.util.Base64.decode(modelBase64, android.util.Base64.DEFAULT)
+        } catch (_: Exception) { null }
+        else -> loadTestModelFromAssets(qnnTestModelAsset)
+      }
+      val canInit = providerCompiled && modelBytes != null && canReallyUseQnn(modelBytes)
+      val map = Arguments.createMap()
+      map.putBoolean("providerCompiled", providerCompiled)
+      map.putBoolean("hasAccelerator", hasAccelerator)
+      map.putBoolean("canInit", canInit)
+      android.util.Log.i(NAME, "QNN support: providerCompiled=$providerCompiled hasAccelerator=$hasAccelerator canInit=$canInit (canInit test: $modelSource)")
+      promise.resolve(map)
+    } catch (e: Exception) {
+      android.util.Log.e(NAME, "getQnnSupport failed", e)
+      promise.reject("QNN_SUPPORT_ERROR", "Failed to get QNN support: ${e.message}", e)
+    }
+  }
+
+  private fun canReallyUseQnn(modelBytes: ByteArray): Boolean {
+    if (modelBytes.isEmpty()) return false
+    return try {
+      ai.onnxruntime.OrtSession.SessionOptions().use { opts ->
+        opts.addQnn(emptyMap())
+        ai.onnxruntime.OrtEnvironment.getEnvironment().createSession(modelBytes, opts).use { }
+      }
+      true
+    } catch (_: Throwable) {
+      false
+    }
+  }
+
+  override fun getAvailableProviders(promise: Promise) {
+    try {
+      val providers = ai.onnxruntime.OrtEnvironment.getAvailableProviders()
+      val list = Arguments.createArray()
+      for (p in providers) {
+        list.pushString(p.name)
+      }
+      promise.resolve(list)
+    } catch (e: Exception) {
+      android.util.Log.e(NAME, "getAvailableProviders failed", e)
+      promise.reject("PROVIDERS_ERROR", "Failed to get available providers: ${e.message}", e)
+    }
+  }
+
+  override fun getDeviceQnnSoc(promise: Promise) {
+    try {
+      var soc: String? = null
+      if (android.os.Build.VERSION.SDK_INT >= 31) {
+        val buildClass = Class.forName("android.os.Build")
+        val field = buildClass.getDeclaredField("SOC_MODEL")
+        val value = field.get(null) as? String
+        soc = value?.trim()?.takeIf { it.isNotEmpty() }
+      }
+      val isSupported = soc != null && soc.matches(Regex("^SM8\\d{3}$", RegexOption.IGNORE_CASE))
+      val map = Arguments.createMap()
+      map.putString("soc", soc)
+      map.putBoolean("isSupported", isSupported)
+      promise.resolve(map)
+    } catch (e: Exception) {
+      android.util.Log.w(NAME, "getDeviceQnnSoc: ${e.message}")
+      val map = Arguments.createMap()
+      map.putNull("soc")
+      map.putBoolean("isSupported", false)
+      promise.resolve(map)
+    }
+  }
+
+  /** Asset path for embedded NNAPI test model (ORT testdata: nnapi_internal_uint8_support). */
+  private val nnapiTestModelAsset = "testModels/nnapi_internal_uint8_support.onnx"
+
+  /**
+   * NNAPI support (AccelerationSupport): providerCompiled, hasAccelerator (native), canInit (session test).
+   * If modelBase64 is not provided, uses embedded test model from assets for canInit.
+   */
+  override fun getNnapiSupport(modelBase64: String?, promise: Promise) {
+    try {
+      val providers = ai.onnxruntime.OrtEnvironment.getAvailableProviders()
+      val providerCompiled = providers.any { it.name.contains("NNAPI", ignoreCase = true) }
+      val hasAccelerator = try { nativeHasNnapiAccelerator(android.os.Build.VERSION.SDK_INT) } catch (_: Exception) { false }
+      val modelSource = if (!modelBase64.isNullOrEmpty()) "user-provided modelBase64" else "embedded test model"
+      val modelBytes = when {
+        !modelBase64.isNullOrEmpty() -> try {
+          android.util.Base64.decode(modelBase64, android.util.Base64.DEFAULT)
+        } catch (_: Exception) { null }
+        else -> loadTestModelFromAssets(nnapiTestModelAsset)
+      }
+      val canInit = providerCompiled && modelBytes != null && canReallyUseNnapi(modelBytes)
+      val map = Arguments.createMap()
+      map.putBoolean("providerCompiled", providerCompiled)
+      map.putBoolean("hasAccelerator", hasAccelerator)
+      map.putBoolean("canInit", canInit)
+      android.util.Log.i(NAME, "NNAPI support: providerCompiled=$providerCompiled hasAccelerator=$hasAccelerator canInit=$canInit (canInit test: $modelSource)")
+      promise.resolve(map)
+    } catch (e: Exception) {
+      android.util.Log.e(NAME, "getNnapiSupport failed", e)
+      promise.reject("NNAPI_SUPPORT_ERROR", "Failed to get NNAPI support: ${e.message}", e)
+    }
+  }
+
+  private fun canReallyUseNnapi(modelBytes: ByteArray): Boolean {
+    if (modelBytes.isEmpty()) return false
+    return try {
+      ai.onnxruntime.OrtSession.SessionOptions().use { opts ->
+        opts.addNnapi()
+        ai.onnxruntime.OrtEnvironment.getEnvironment().createSession(modelBytes, opts).use { }
+      }
+      true
+    } catch (_: Throwable) {
+      false
+    }
+  }
+
+  /** Asset path for embedded XNNPACK test model (ORT testdata: add_mul_add). */
+  private val xnnpackTestModelAsset = "testModels/add_mul_add.onnx"
+
+  /**
+   * XNNPACK support (AccelerationSupport): providerCompiled, hasAccelerator = true when compiled (CPU-optimized), canInit (session test).
+   * If modelBase64 is not provided, uses embedded test model from assets for canInit.
+   */
+  override fun getXnnpackSupport(modelBase64: String?, promise: Promise) {
+    try {
+      val providers = ai.onnxruntime.OrtEnvironment.getAvailableProviders()
+      val providerCompiled = providers.any { it.name.contains("XNNPACK", ignoreCase = true) }
+      val modelSource = if (!modelBase64.isNullOrEmpty()) "user-provided modelBase64" else "embedded test model"
+      val modelBytes = when {
+        !modelBase64.isNullOrEmpty() -> try {
+          android.util.Base64.decode(modelBase64, android.util.Base64.DEFAULT)
+        } catch (_: Exception) { null }
+        else -> loadTestModelFromAssets(xnnpackTestModelAsset)
+      }
+      val canInit = providerCompiled && modelBytes != null && canReallyUseXnnpack(modelBytes)
+      val hasAccelerator = providerCompiled // XNNPACK: CPU-optimized
+      val map = Arguments.createMap()
+      map.putBoolean("providerCompiled", providerCompiled)
+      map.putBoolean("hasAccelerator", hasAccelerator)
+      map.putBoolean("canInit", canInit)
+      android.util.Log.i(NAME, "XNNPACK support: providerCompiled=$providerCompiled hasAccelerator=$hasAccelerator canInit=$canInit (canInit test: $modelSource)")
+      promise.resolve(map)
+    } catch (e: Exception) {
+      android.util.Log.e(NAME, "getXnnpackSupport failed", e)
+      promise.reject("XNNPACK_SUPPORT_ERROR", "Failed to get XNNPACK support: ${e.message}", e)
+    }
+  }
+
+  /**
+   * Load embedded ONNX test model from module assets (used for NNAPI/XNNPACK canInit when no modelBase64 is passed).
+   */
+  private fun loadTestModelFromAssets(assetPath: String): ByteArray? {
+    return try {
+      reactApplicationContext.assets.open(assetPath).use { it.readBytes() }
+    } catch (e: Exception) {
+      android.util.Log.w(NAME, "Could not load test model from assets: $assetPath", e)
+      null
+    }
+  }
+
+  private fun canReallyUseXnnpack(modelBytes: ByteArray): Boolean {
+    if (modelBytes.isEmpty()) return false
+    return try {
+      ai.onnxruntime.OrtSession.SessionOptions().use { opts ->
+        opts.addXnnpack(emptyMap())
+        ai.onnxruntime.OrtEnvironment.getEnvironment().createSession(modelBytes, opts).use { }
+      }
+      true
+    } catch (_: Throwable) {
+      false
+    }
+  }
+
+  /**
+   * Core ML support (AccelerationSupport). Android: always false (Core ML is iOS-only).
+   */
+  override fun getCoreMlSupport(modelBase64: String?, promise: Promise) {
+    try {
+      val map = Arguments.createMap()
+      map.putBoolean("providerCompiled", false)
+      map.putBoolean("hasAccelerator", false)
+      map.putBoolean("canInit", false)
+      promise.resolve(map)
+    } catch (e: Exception) {
+      android.util.Log.e(NAME, "getCoreMlSupport failed", e)
+      promise.reject("COREML_SUPPORT_ERROR", "Failed to get Core ML support: ${e.message}", e)
+    }
+  }
+
+  /**
+   * Resolve model path based on configuration.
+   * Handles asset paths, file system paths, and auto-detection.
+   */
+  override fun resolveModelPath(config: ReadableMap, promise: Promise) {
+    assetHelper.resolveModelPath(config, promise)
+  }
+
+  override fun extractTarBz2(
+    sourcePath: String,
+    targetPath: String,
+    force: Boolean,
+    showNotificationsEnabled: Boolean?,
+    notificationTitle: String?,
+    notificationText: String?,
+    promise: Promise,
+  ) {
+    val notif = extractionNotificationOrNull(
+      showNotificationsEnabled,
+      notificationTitle,
+      notificationText,
+    )
+    archiveHelper.extractTarBz2(
+      sourcePath,
+      targetPath,
+      force,
+      promise,
+      { bytes, total, percent ->
+        emitExtractProgress(sourcePath, bytes, total, percent)
+      },
+      notif,
+    )
+  }
+
+  override fun cancelExtractTarBz2(promise: Promise) {
+    archiveHelper.cancelExtractTarBz2()
+    promise.resolve(null)
+  }
+
+  override fun extractTarZst(
+    sourcePath: String,
+    targetPath: String,
+    force: Boolean,
+    showNotificationsEnabled: Boolean?,
+    notificationTitle: String?,
+    notificationText: String?,
+    promise: Promise,
+  ) {
+    val notif = extractionNotificationOrNull(
+      showNotificationsEnabled,
+      notificationTitle,
+      notificationText,
+    )
+    archiveHelper.extractTarZst(
+      sourcePath,
+      targetPath,
+      force,
+      promise,
+      { bytes, total, percent ->
+        emitExtractTarZstProgress(sourcePath, bytes, total, percent)
+      },
+      notif,
+    )
+  }
+
+  override fun cancelExtractTarZst(promise: Promise) {
+    archiveHelper.cancelExtractTarZst()
+    promise.resolve(null)
+  }
+
+  override fun cancelExtractBySourcePath(sourcePath: String, promise: Promise) {
+    archiveHelper.cancelExtractBySourcePath(sourcePath)
+    promise.resolve(null)
+  }
+
+  override fun computeFileSha256(filePath: String, promise: Promise) {
+    archiveHelper.computeFileSha256(filePath, promise)
+  }
+
+  private fun emitExtractProgress(sourcePath: String, bytes: Long, totalBytes: Long, percent: Double) {
+    val eventEmitter = reactApplicationContext
+      .getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter::class.java)
+    val payload = Arguments.createMap()
+    payload.putString("sourcePath", sourcePath)
+    payload.putDouble("bytes", bytes.toDouble())
+    payload.putDouble("totalBytes", totalBytes.toDouble())
+    payload.putDouble("percent", percent)
+    eventEmitter.emit("extractTarBz2Progress", payload)
+  }
+
+  private fun emitExtractTarZstProgress(sourcePath: String, bytes: Long, totalBytes: Long, percent: Double) {
+    val eventEmitter = reactApplicationContext
+      .getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter::class.java)
+    val payload = Arguments.createMap()
+    payload.putString("sourcePath", sourcePath)
+    payload.putDouble("bytes", bytes.toDouble())
+    payload.putDouble("totalBytes", totalBytes.toDouble())
+    payload.putDouble("percent", percent)
+    eventEmitter.emit("extractTarZstProgress", payload)
+  }
+
+  /** Null when extraction notifications are disabled (`showNotificationsEnabled == false`). */
+  private fun extractionNotificationOrNull(
+    showNotificationsEnabled: Boolean?,
+    notificationTitle: String?,
+    notificationText: String?,
+  ): SherpaOnnxExtractionNotificationHelper? {
+    return SherpaOnnxExtractionNotificationHelper.maybeCreate(
+      reactApplicationContext,
+      showNotificationsEnabled,
+      notificationTitle,
+      notificationText,
+    )
+  }
+
+  /**
+   * Resolve asset path - copy from assets to internal storage if needed
+   * Preserves the directory structure from assets (e.g., test_wavs/ stays as test_wavs/)
+   */
+
+  /**
+   * Detect STT model type and structure without initializing the recognizer.
+   */
+  override fun detectSttModel(
+    modelDir: String,
+    preferInt8: Boolean?,
+    modelType: String?,
+    promise: Promise
+  ) {
+    try {
+      val result = Companion.nativeDetectSttModel(
+        modelDir,
+        preferInt8 ?: false,
+        preferInt8 != null,
+        modelType ?: "auto",
+        false
+      )
+      if (result == null) {
+        android.util.Log.e(NAME, "DETECT_ERROR: STT model detection returned null")
+        promise.reject("DETECT_ERROR", "STT model detection returned null")
+        return
+      }
+      val success = result["success"] as? Boolean ?: false
+      val isHardwareSpecificUnsupported = result["isHardwareSpecificUnsupported"] as? Boolean ?: false
+      val detectedModels = result["detectedModels"] as? ArrayList<*>
+        ?: arrayListOf<HashMap<String, String>>()
+      val modelTypeStr = result["modelType"] as? String
+
+      val resultMap = Arguments.createMap()
+      resultMap.putBoolean("success", success)
+      resultMap.putBoolean("isHardwareSpecificUnsupported", isHardwareSpecificUnsupported)
+      val modelsArray = Arguments.createArray()
+      for (model in detectedModels) {
+        val modelMap = model as? HashMap<*, *>
+        if (modelMap != null) {
+          val entry = Arguments.createMap()
+          entry.putString("type", modelMap["type"] as? String ?: "")
+          entry.putString("modelDir", modelMap["modelDir"] as? String ?: "")
+          modelsArray.pushMap(entry)
+        }
+      }
+      resultMap.putArray("detectedModels", modelsArray)
+      if (modelTypeStr != null) {
+        resultMap.putString("modelType", modelTypeStr)
+      }
+      if (!success) {
+        val error = result["error"] as? String
+        if (!error.isNullOrBlank()) {
+          resultMap.putString("error", error)
+        }
+      }
+      promise.resolve(resultMap)
+    } catch (e: Exception) {
+      android.util.Log.e(NAME, "DETECT_ERROR: STT model detection failed: ${e.message}", e)
+      promise.reject("DETECT_ERROR", "STT model detection failed: ${e.message}", e)
+    }
+  }
+
+  /**
+   * Initialize Speech-to-Text (STT) with model directory.
+   */
+  override fun initializeStt(
+    instanceId: String,
+    modelDir: String,
+    preferInt8: Boolean?,
+    modelType: String?,
+    debug: Boolean?,
+    hotwordsFile: String?,
+    hotwordsScore: Double?,
+    numThreads: Double?,
+    provider: String?,
+    ruleFsts: String?,
+    ruleFars: String?,
+    dither: Double?,
+    modelOptions: ReadableMap?,
+    modelingUnit: String?,
+    bpeVocab: String?,
+    promise: Promise
+  ) {
+    sttHelper.initializeStt(instanceId, modelDir, preferInt8, modelType, debug, hotwordsFile, hotwordsScore, numThreads, provider, ruleFsts, ruleFars, dither, modelOptions, modelingUnit, bpeVocab, promise)
+  }
+
+  /**
+   * Release STT resources.
+   */
+  override fun unloadStt(instanceId: String, promise: Promise) {
+    sttHelper.unloadStt(instanceId, promise)
+  }
+
+  // ==================== Online (streaming) STT Methods ====================
+
+  override fun initializeOnlineSttWithOptions(instanceId: String, options: ReadableMap, promise: Promise) {
+    val modelDir = options.getString("modelDir")
+    if (modelDir.isNullOrEmpty()) {
+      promise.reject("INIT_ERROR", "modelDir is required")
+      return
+    }
+    val modelType = options.getString("modelType") ?: "transducer"
+    val enableEndpoint = if (options.hasKey("enableEndpoint")) options.getBoolean("enableEndpoint") else true
+    val decodingMethod = options.getString("decodingMethod") ?: "greedy_search"
+    val maxActivePaths = if (options.hasKey("maxActivePaths")) options.getDouble("maxActivePaths").toInt() else 4
+    val hotwordsFile = if (options.hasKey("hotwordsFile")) options.getString("hotwordsFile") else null
+    val hotwordsScore = if (options.hasKey("hotwordsScore")) options.getDouble("hotwordsScore") else null
+    val numThreads = if (options.hasKey("numThreads")) options.getDouble("numThreads") else null
+    val provider = if (options.hasKey("provider")) options.getString("provider") else null
+    val ruleFsts = if (options.hasKey("ruleFsts")) options.getString("ruleFsts") else null
+    val ruleFars = if (options.hasKey("ruleFars")) options.getString("ruleFars") else null
+    val dither = if (options.hasKey("dither")) options.getDouble("dither") else null
+    val blankPenalty = if (options.hasKey("blankPenalty")) options.getDouble("blankPenalty") else null
+    val debug = if (options.hasKey("debug")) options.getBoolean("debug") else null
+    val rule1MustContainNonSilence = if (options.hasKey("rule1MustContainNonSilence")) options.getBoolean("rule1MustContainNonSilence") else null
+    val rule1MinTrailingSilence = if (options.hasKey("rule1MinTrailingSilence")) options.getDouble("rule1MinTrailingSilence") else null
+    val rule1MinUtteranceLength = if (options.hasKey("rule1MinUtteranceLength")) options.getDouble("rule1MinUtteranceLength") else null
+    val rule2MustContainNonSilence = if (options.hasKey("rule2MustContainNonSilence")) options.getBoolean("rule2MustContainNonSilence") else null
+    val rule2MinTrailingSilence = if (options.hasKey("rule2MinTrailingSilence")) options.getDouble("rule2MinTrailingSilence") else null
+    val rule2MinUtteranceLength = if (options.hasKey("rule2MinUtteranceLength")) options.getDouble("rule2MinUtteranceLength") else null
+    val rule3MustContainNonSilence = if (options.hasKey("rule3MustContainNonSilence")) options.getBoolean("rule3MustContainNonSilence") else null
+    val rule3MinTrailingSilence = if (options.hasKey("rule3MinTrailingSilence")) options.getDouble("rule3MinTrailingSilence") else null
+    val rule3MinUtteranceLength = if (options.hasKey("rule3MinUtteranceLength")) options.getDouble("rule3MinUtteranceLength") else null
+    onlineSttHelper.initializeOnlineStt(
+      instanceId,
+      modelDir,
+      modelType,
+      enableEndpoint,
+      decodingMethod,
+      maxActivePaths,
+      hotwordsFile,
+      hotwordsScore,
+      numThreads,
+      provider,
+      ruleFsts,
+      ruleFars,
+      dither,
+      blankPenalty,
+      debug,
+      rule1MustContainNonSilence,
+      rule1MinTrailingSilence,
+      rule1MinUtteranceLength,
+      rule2MustContainNonSilence,
+      rule2MinTrailingSilence,
+      rule2MinUtteranceLength,
+      rule3MustContainNonSilence,
+      rule3MinTrailingSilence,
+      rule3MinUtteranceLength,
+      promise
+    )
+  }
+
+  override fun createSttStream(instanceId: String, streamId: String, hotwords: String?, promise: Promise) {
+    onlineSttHelper.createSttStream(instanceId, streamId, hotwords, promise)
+  }
+
+  override fun acceptSttWaveform(streamId: String, samples: ReadableArray, sampleRate: Double, promise: Promise) {
+    onlineSttHelper.acceptSttWaveform(streamId, samples, sampleRate.toInt(), promise)
+  }
+
+  override fun sttStreamInputFinished(streamId: String, promise: Promise) {
+    onlineSttHelper.sttStreamInputFinished(streamId, promise)
+  }
+
+  override fun decodeSttStream(streamId: String, promise: Promise) {
+    onlineSttHelper.decodeSttStream(streamId, promise)
+  }
+
+  override fun isSttStreamReady(streamId: String, promise: Promise) {
+    onlineSttHelper.isSttStreamReady(streamId, promise)
+  }
+
+  override fun getSttStreamResult(streamId: String, promise: Promise) {
+    onlineSttHelper.getSttStreamResult(streamId, promise)
+  }
+
+  override fun isSttStreamEndpoint(streamId: String, promise: Promise) {
+    onlineSttHelper.isSttStreamEndpoint(streamId, promise)
+  }
+
+  override fun resetSttStream(streamId: String, promise: Promise) {
+    onlineSttHelper.resetSttStream(streamId, promise)
+  }
+
+  override fun releaseSttStream(streamId: String, promise: Promise) {
+    onlineSttHelper.releaseSttStream(streamId, promise)
+  }
+
+  override fun unloadOnlineStt(instanceId: String, promise: Promise) {
+    onlineSttHelper.unloadOnlineStt(instanceId, promise)
+  }
+
+  override fun processSttAudioChunk(streamId: String, samples: ReadableArray, sampleRate: Double, promise: Promise) {
+    onlineSttHelper.processSttAudioChunk(streamId, samples, sampleRate.toInt(), promise)
+  }
+
+  override fun startPcmLiveStream(options: ReadableMap, promise: Promise) {
+    try {
+      pcmCapture?.stop()
+      pcmCapture = null
+      val sampleRate = options.getDouble("sampleRate").toInt().takeIf { it > 0 } ?: 16000
+      val channelCount = if (options.hasKey("channelCount")) options.getDouble("channelCount").toInt().coerceIn(1, 2) else 1
+      val bufferSizeFrames = if (options.hasKey("bufferSizeFrames")) options.getDouble("bufferSizeFrames").toInt() else 0
+      var startError: String? = null
+      var started = false
+      val capture = SherpaOnnxPcmCapture(
+        targetSampleRate = sampleRate,
+        channelCount = channelCount,
+        bufferSizeFrames = bufferSizeFrames,
+        onChunk = { base64Pcm, sr -> emitPcmLiveStreamData(base64Pcm, sr) },
+        onError = { msg ->
+          if (!started) {
+            startError = msg
+          } else {
+            emitPcmLiveStreamError(msg)
+          }
+        },
+        logTag = NAME
+      )
+      pcmCapture = capture
+      capture.start()
+      started = true
+      val err = startError
+      if (err != null) {
+        promise.reject("PCM_LIVE_STREAM_ERROR", err)
+      } else {
+        promise.resolve(null)
+      }
+    } catch (e: Exception) {
+      android.util.Log.e(NAME, "startPcmLiveStream failed", e)
+      promise.reject("PCM_LIVE_STREAM_ERROR", e.message ?: "Failed to start PCM capture", e)
+    }
+  }
+
+  override fun stopPcmLiveStream(promise: Promise) {
+    try {
+      pcmCapture?.stop()
+      pcmCapture = null
+      promise.resolve(null)
+    } catch (e: Exception) {
+      promise.reject("PCM_LIVE_STREAM_ERROR", e.message ?: "Failed to stop PCM capture", e)
+    }
+  }
+
+  private fun emitPcmLiveStreamData(base64Pcm: String, sampleRate: Int) {
+    val eventEmitter = reactApplicationContext
+      .getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter::class.java)
+    val payload = Arguments.createMap()
+    payload.putString("base64Pcm", base64Pcm)
+    payload.putInt("sampleRate", sampleRate)
+    eventEmitter.emit("pcmLiveStreamData", payload)
+  }
+
+  private fun emitPcmLiveStreamError(message: String) {
+    val eventEmitter = reactApplicationContext
+      .getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter::class.java)
+    val payload = Arguments.createMap()
+    payload.putString("message", message)
+    eventEmitter.emit("pcmLiveStreamError", payload)
+  }
+
+  // ==================== STT Methods ====================
+
+  /**
+   * Transcribe an audio file. Returns full result (text, tokens, timestamps, lang, emotion, event, durations).
+   */
+  override fun transcribeFile(instanceId: String, filePath: String, promise: Promise) {
+    sttHelper.transcribeFile(instanceId, filePath, promise)
+  }
+
+  /**
+   * Transcribe from float PCM samples.
+   */
+  override fun transcribeSamples(instanceId: String, samples: ReadableArray, sampleRate: Double, promise: Promise) {
+    sttHelper.transcribeSamples(instanceId, samples, sampleRate.toInt(), promise)
+  }
+
+  /**
+   * Update recognizer config at runtime.
+   */
+  override fun setSttConfig(instanceId: String, options: ReadableMap, promise: Promise) {
+    sttHelper.setSttConfig(instanceId, options, promise)
+  }
+
+  /**
+   * If inputPath is a content:// URI, copies it to a temp file via ContentResolver.openInputStream.
+   * Caller deletes the returned temp file in a finally block.
+   */
+  private fun resolveInputForConvert(inputPath: String): Pair<String, java.io.File?> {
+    if (!inputPath.startsWith("content://")) return Pair(inputPath, null)
+    val uri = Uri.parse(inputPath)
+    val resolver = reactApplicationContext.contentResolver
+    val ext = android.webkit.MimeTypeMap.getSingleton()
+      .getExtensionFromMimeType(resolver.getType(uri)) ?: "tmp"
+    val tmp = java.io.File(reactApplicationContext.cacheDir, "convert_${System.nanoTime()}.$ext")
+    resolver.openInputStream(uri)?.use { input ->
+      tmp.outputStream().use { output -> input.copyTo(output) }
+    } ?: throw IllegalStateException("Content URI not readable: $inputPath")
+    return Pair(tmp.absolutePath, tmp)
+  }
+
+  /**
+   * Convert any supported audio file to a requested format using native FFmpeg prebuilts.
+   * Accepts file paths and content:// URIs. Content URIs are transparently copied to a
+   * temp file first (via ContentResolver), converted, then the temp file is deleted.
+   */
+  override fun convertAudioToFormat(inputPath: String, outputPath: String, format: String, outputSampleRateHz: Double?, promise: Promise) {
+    var tmpFile: java.io.File? = null
+    try {
+      var rate = outputSampleRateHz?.toInt() ?: 0
+
+      if (rate < 0) {
+        promise.reject("CONVERT_ERROR", "Invalid outputSampleRateHz: must be >= 0")
+        return
+      }
+
+      if (format.equals("mp3", ignoreCase = true)) {
+        val allowed = setOf(0, 32000, 44100, 48000)
+        if (!allowed.contains(rate)) {
+          promise.reject("CONVERT_ERROR", "MP3 output sample rate must be one of 32000, 44100, 48000, or 0 (default). Received: $rate")
+          return
+        }
+      } else if (format.equals("opus", ignoreCase = true) || format.equals("oggm", ignoreCase = true) || format.equals("webm", ignoreCase = true) || format.equals("mkv", ignoreCase = true) || format.equals("ogg", ignoreCase = true)) {
+        val allowed = setOf(0, 8000, 12000, 16000, 24000, 48000)
+        if (!allowed.contains(rate)) {
+          promise.reject("CONVERT_ERROR", "Opus output sample rate must be 8000, 12000, 16000, 24000, 48000, or 0 (default). Received: $rate")
+          return
+        }
+      } else {
+        rate = rate.coerceIn(0, 48000)
+      }
+
+      val (pathToUse, tmp) = resolveInputForConvert(inputPath)
+      tmpFile = tmp
+      val err = Companion.nativeConvertAudioToFormat(pathToUse, outputPath, format, rate)
+      if (err.isEmpty()) {
+        promise.resolve(null)
+      } else {
+        android.util.Log.e(NAME, "CONVERT_ERROR: $err (inputPath=$inputPath)")
+        promise.reject("CONVERT_ERROR", err)
+      }
+    } catch (e: Exception) {
+      android.util.Log.e(NAME, "CONVERT_EXCEPTION: Failed to convert audio: ${e.message}", e)
+      promise.reject("CONVERT_EXCEPTION", "Failed to convert audio: ${e.message}", e)
+    } finally {
+      tmpFile?.delete()
+    }
+  }
+
+  /**
+   * Convert any supported audio file to WAV 16 kHz mono 16-bit PCM using native FFmpeg prebuilts.
+   * Accepts file paths and content:// URIs. Content URIs are copied to a temp file first.
+   */
+  override fun convertAudioToWav16k(inputPath: String, outputPath: String, promise: Promise) {
+    var tmpFile: java.io.File? = null
+    try {
+      val (pathToUse, tmp) = resolveInputForConvert(inputPath)
+      tmpFile = tmp
+      val err = Companion.nativeConvertAudioToWav16k(pathToUse, outputPath)
+      if (err.isEmpty()) {
+        promise.resolve(null)
+      } else {
+        android.util.Log.e(NAME, "CONVERT_ERROR: $err")
+        promise.reject("CONVERT_ERROR", err)
+      }
+    } catch (e: Exception) {
+      android.util.Log.e(NAME, "CONVERT_EXCEPTION: Failed to convert audio to WAV16k: ${e.message}", e)
+      promise.reject("CONVERT_EXCEPTION", "Failed to convert audio to WAV16k: ${e.message}", e)
+    } finally {
+      tmpFile?.delete()
+    }
+  }
+
+  /**
+   * Decode audio to mono float samples (approx. [-1, 1]) and effective sample rate.
+   * Same path/URI handling as [convertAudioToFormat]. WAV may use [WaveReader] when no resample is requested.
+   */
+  override fun decodeAudioFileToFloatSamples(inputPath: String, targetSampleRateHz: Double?, promise: Promise) {
+    var tmpFile: java.io.File? = null
+    try {
+      val targetHz = (targetSampleRateHz ?: 0.0).toInt()
+      if (targetHz < 0) {
+        promise.reject("DECODE_ERROR", "targetSampleRateHz must be >= 0")
+        return
+      }
+      val (pathToUse, tmp) = resolveInputForConvert(inputPath)
+      tmpFile = tmp
+
+      if (pathToUse.endsWith(".wav", ignoreCase = true)) {
+        try {
+          val wave = WaveReader.readWave(pathToUse)
+          val s = wave.samples
+          if (s != null && s.isNotEmpty() && wave.sampleRate > 0 && (targetHz == 0 || targetHz == wave.sampleRate)) {
+            val map = Arguments.createMap()
+            val arr = Arguments.createArray()
+            for (i in s.indices) {
+              arr.pushDouble(s[i].toDouble())
+            }
+            map.putArray("samples", arr)
+            map.putInt("sampleRate", wave.sampleRate)
+            promise.resolve(map)
+            return
+          }
+        } catch (_: Throwable) {
+          // Fall through to FFmpeg/native path (e.g. odd WAV or resample requested).
+        }
+      }
+
+      val result = Companion.nativeDecodeAudioFileToFloatSamples(pathToUse, targetHz)
+      if (result.size == 1 && result[0] is String) {
+        promise.reject("DECODE_ERROR", result[0] as String)
+        return
+      }
+      if (result.size != 2 || result[0] !is FloatArray) {
+        promise.reject("DECODE_ERROR", "Unexpected native decode result")
+        return
+      }
+      val floats = result[0] as FloatArray
+      val rateObj = result.getOrNull(1) as? Number ?: run {
+        promise.reject("DECODE_ERROR", "Unexpected sample rate in native decode result")
+        return
+      }
+      val sr = rateObj.toInt()
+      val map = Arguments.createMap()
+      val arr = Arguments.createArray()
+      for (i in floats.indices) {
+        arr.pushDouble(floats[i].toDouble())
+      }
+      map.putArray("samples", arr)
+      map.putInt("sampleRate", sr)
+      promise.resolve(map)
+    } catch (e: Exception) {
+      android.util.Log.e(NAME, "DECODE_EXCEPTION: ${e.message}", e)
+      promise.reject("DECODE_EXCEPTION", e.message ?: "Failed to decode audio", e)
+    } finally {
+      tmpFile?.delete()
+    }
+  }
+
+  // ==================== TTS Methods ====================
+
+  /**
+   * Initialize TTS with model directory.
+   */
+  override fun initializeTts(
+    instanceId: String,
+    modelDir: String,
+    modelType: String,
+    numThreads: Double,
+    debug: Boolean,
+    noiseScale: Double?,
+    noiseScaleW: Double?,
+    lengthScale: Double?,
+    ruleFsts: String?,
+    ruleFars: String?,
+    maxNumSentences: Double?,
+    silenceScale: Double?,
+    provider: String?,
+    promise: Promise
+  ) {
+    ttsHelper.initializeTts(
+      instanceId,
+      modelDir,
+      modelType,
+      numThreads,
+      debug,
+      noiseScale,
+      noiseScaleW,
+      lengthScale,
+      ruleFsts,
+      ruleFars,
+      maxNumSentences,
+      silenceScale,
+      provider,
+      promise
+    )
+  }
+
+  /**
+   * Detect TTS model type and structure without initializing the engine.
+   */
+  override fun detectTtsModel(modelDir: String, modelType: String?, promise: Promise) {
+    try {
+      val result = Companion.nativeDetectTtsModel(modelDir, modelType ?: "auto")
+      if (result == null) {
+        android.util.Log.e(NAME, "DETECT_ERROR: TTS model detection returned null")
+        promise.reject("DETECT_ERROR", "TTS model detection returned null")
+        return
+      }
+      val success = result["success"] as? Boolean ?: false
+      val detectedModels = result["detectedModels"] as? ArrayList<*>
+        ?: arrayListOf<HashMap<String, String>>()
+      val modelTypeStr = result["modelType"] as? String
+
+      val resultMap = Arguments.createMap()
+      resultMap.putBoolean("success", success)
+      val modelsArray = Arguments.createArray()
+      for (model in detectedModels) {
+        val modelMap = model as? HashMap<*, *>
+        if (modelMap != null) {
+          val entry = Arguments.createMap()
+          entry.putString("type", modelMap["type"] as? String ?: "")
+          entry.putString("modelDir", modelMap["modelDir"] as? String ?: "")
+          modelsArray.pushMap(entry)
+        }
+      }
+      resultMap.putArray("detectedModels", modelsArray)
+      if (modelTypeStr != null) {
+        resultMap.putString("modelType", modelTypeStr)
+      }
+      if (!success) {
+        val error = result["error"] as? String
+        if (!error.isNullOrBlank()) {
+          resultMap.putString("error", error)
+        }
+      }
+      val lexiconLanguageCandidates = result["lexiconLanguageCandidates"] as? ArrayList<*>
+      if (!lexiconLanguageCandidates.isNullOrEmpty()) {
+        val candidatesArray = Arguments.createArray()
+        for (c in lexiconLanguageCandidates) {
+          (c as? String)?.let { candidatesArray.pushString(it) }
+        }
+        resultMap.putArray("lexiconLanguageCandidates", candidatesArray)
+      }
+      promise.resolve(resultMap)
+    } catch (e: Exception) {
+      android.util.Log.e(NAME, "DETECT_ERROR: TTS model detection failed: ${e.message}", e)
+      promise.reject("DETECT_ERROR", "TTS model detection failed: ${e.message}", e)
+    }
+  }
+
+  /**
+   * Update TTS params by re-initializing with stored config.
+   */
+  override fun updateTtsParams(
+    instanceId: String,
+    noiseScale: Double?,
+    noiseScaleW: Double?,
+    lengthScale: Double?,
+    promise: Promise
+  ) {
+    ttsHelper.updateTtsParams(instanceId, noiseScale, noiseScaleW, lengthScale, promise)
+  }
+
+  /**
+   * Generate speech from text.
+   */
+  override fun generateTts(instanceId: String, text: String, options: ReadableMap?, promise: Promise) {
+    ttsHelper.generateTts(instanceId, text, options, promise)
+  }
+
+  /**
+   * Generate speech with subtitle/timestamp metadata.
+   */
+  override fun generateTtsWithTimestamps(instanceId: String, text: String, options: ReadableMap?, promise: Promise) {
+    ttsHelper.generateTtsWithTimestamps(instanceId, text, options, promise)
+  }
+
+  /**
+   * Generate speech in streaming mode (emits chunk events).
+   */
+  override fun generateTtsStream(instanceId: String, requestId: String, text: String, options: ReadableMap?, promise: Promise) {
+    ttsHelper.generateTtsStream(instanceId, requestId, text, options, promise)
+  }
+
+  /**
+   * Cancel ongoing streaming TTS.
+   */
+  override fun cancelTtsStream(instanceId: String, promise: Promise) {
+    ttsHelper.cancelTtsStream(instanceId, promise)
+  }
+
+  /**
+   * Start PCM playback for streaming TTS.
+   */
+  override fun startTtsPcmPlayer(instanceId: String, sampleRate: Double, channels: Double, promise: Promise) {
+    ttsHelper.startTtsPcmPlayer(instanceId, sampleRate, channels, promise)
+  }
+
+  /**
+   * Write PCM samples to the streaming TTS player.
+   */
+  override fun writeTtsPcmChunk(instanceId: String, samples: ReadableArray, promise: Promise) {
+    ttsHelper.writeTtsPcmChunk(instanceId, samples, promise)
+  }
+
+  /**
+   * Stop PCM playback for streaming TTS.
+   */
+  override fun stopTtsPcmPlayer(instanceId: String, promise: Promise) {
+    ttsHelper.stopTtsPcmPlayer(instanceId, promise)
+  }
+
+  private fun emitTtsStreamChunk(
+    instanceId: String,
+    requestId: String,
+    samples: FloatArray,
+    sampleRate: Int,
+    progress: Float,
+    isFinal: Boolean
+  ) {
+    val eventEmitter = reactApplicationContext
+      .getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter::class.java)
+    val samplesArray = Arguments.createArray()
+    for (sample in samples) {
+      samplesArray.pushDouble(sample.toDouble())
+    }
+    val payload = Arguments.createMap()
+    payload.putString("instanceId", instanceId)
+    payload.putString("requestId", requestId)
+    payload.putArray("samples", samplesArray)
+    payload.putInt("sampleRate", sampleRate)
+    payload.putDouble("progress", progress.toDouble())
+    payload.putBoolean("isFinal", isFinal)
+    eventEmitter.emit("ttsStreamChunk", payload)
+  }
+
+  private fun emitTtsStreamError(instanceId: String, requestId: String, message: String) {
+    val eventEmitter = reactApplicationContext
+      .getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter::class.java)
+    val payload = Arguments.createMap()
+    payload.putString("instanceId", instanceId)
+    payload.putString("requestId", requestId)
+    payload.putString("message", message)
+    eventEmitter.emit("ttsStreamError", payload)
+  }
+
+  private fun emitTtsStreamEnd(instanceId: String, requestId: String, cancelled: Boolean) {
+    val eventEmitter = reactApplicationContext
+      .getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter::class.java)
+    val payload = Arguments.createMap()
+    payload.putString("instanceId", instanceId)
+    payload.putString("requestId", requestId)
+    payload.putBoolean("cancelled", cancelled)
+    eventEmitter.emit("ttsStreamEnd", payload)
+  }
+
+  /**
+   * Get TTS sample rate.
+   */
+  override fun getTtsSampleRate(instanceId: String, promise: Promise) {
+    ttsHelper.getTtsSampleRate(instanceId, promise)
+  }
+
+  /**
+   * Get number of speakers.
+   */
+  override fun getTtsNumSpeakers(instanceId: String, promise: Promise) {
+    ttsHelper.getTtsNumSpeakers(instanceId, promise)
+  }
+
+  /**
+   * Release TTS resources.
+   */
+  override fun unloadTts(instanceId: String, promise: Promise) {
+    ttsHelper.unloadTts(instanceId, promise)
+  }
+
+  // ==================== Speech Enhancement Methods ====================
+
+  override fun detectEnhancementModel(
+    modelDir: String,
+    modelType: String?,
+    promise: Promise
+  ) {
+    enhancementHelper.detectEnhancementModel(modelDir, modelType, promise)
+  }
+
+  override fun initializeEnhancement(
+    instanceId: String,
+    modelDir: String,
+    modelType: String?,
+    numThreads: Double?,
+    provider: String?,
+    debug: Boolean?,
+    promise: Promise
+  ) {
+    enhancementHelper.initializeEnhancement(
+      instanceId,
+      modelDir,
+      modelType,
+      numThreads,
+      provider,
+      debug,
+      promise
+    )
+  }
+
+  override fun enhanceFile(
+    instanceId: String,
+    inputPath: String,
+    outputPath: String?,
+    promise: Promise
+  ) {
+    enhancementHelper.enhanceFile(instanceId, inputPath, outputPath, promise)
+  }
+
+  override fun enhanceSamples(
+    instanceId: String,
+    samples: ReadableArray,
+    sampleRate: Double,
+    promise: Promise
+  ) {
+    enhancementHelper.enhanceSamples(instanceId, samples, sampleRate, promise)
+  }
+
+  override fun getEnhancementSampleRate(instanceId: String, promise: Promise) {
+    enhancementHelper.getSampleRate(instanceId, promise)
+  }
+
+  override fun unloadEnhancement(instanceId: String, promise: Promise) {
+    enhancementHelper.unloadEnhancement(instanceId, promise)
+  }
+
+  override fun initializeOnlineEnhancement(
+    instanceId: String,
+    modelDir: String,
+    modelType: String?,
+    numThreads: Double?,
+    provider: String?,
+    debug: Boolean?,
+    promise: Promise
+  ) {
+    enhancementHelper.initializeOnlineEnhancement(
+      instanceId,
+      modelDir,
+      modelType,
+      numThreads,
+      provider,
+      debug,
+      promise
+    )
+  }
+
+  override fun feedEnhancementSamples(
+    instanceId: String,
+    samples: ReadableArray,
+    sampleRate: Double,
+    promise: Promise
+  ) {
+    enhancementHelper.feedSamples(instanceId, samples, sampleRate, promise)
+  }
+
+  override fun flushOnlineEnhancement(instanceId: String, promise: Promise) {
+    enhancementHelper.flushOnline(instanceId, promise)
+  }
+
+  override fun resetOnlineEnhancement(instanceId: String, promise: Promise) {
+    enhancementHelper.resetOnline(instanceId, promise)
+  }
+
+  override fun unloadOnlineEnhancement(instanceId: String, promise: Promise) {
+    enhancementHelper.unloadOnline(instanceId, promise)
+  }
+
+  /**
+   * Save TTS audio samples to a WAV file.
+   */
+  override fun saveTtsAudioToFile(
+    samples: ReadableArray,
+    sampleRate: Double,
+    filePath: String,
+    promise: Promise
+  ) {
+    ttsHelper.saveTtsAudioToFile(samples, sampleRate, filePath, promise)
+  }
+
+  /**
+   * Save TTS audio samples to a WAV file via Android SAF content URI.
+   */
+  override fun saveTtsAudioToContentUri(
+    samples: ReadableArray,
+    sampleRate: Double,
+    directoryUri: String,
+    filename: String,
+    promise: Promise
+  ) {
+    ttsHelper.saveTtsAudioToContentUri(samples, sampleRate, directoryUri, filename, promise)
+  }
+
+  /**
+   * Copy a local file into a document under a SAF directory URI (format-agnostic).
+   */
+  override fun copyFileToContentUri(
+    filePath: String,
+    directoryUri: String,
+    filename: String,
+    mimeType: String,
+    promise: Promise
+  ) {
+    ttsHelper.copyFileToContentUri(filePath, directoryUri, filename, mimeType, promise)
+  }
+
+  /**
+   * Save text content to a file via Android SAF content URI.
+   */
+  override fun saveTtsTextToContentUri(
+    text: String,
+    directoryUri: String,
+    filename: String,
+    mimeType: String,
+    promise: Promise
+  ) {
+    ttsHelper.saveTtsTextToContentUri(text, directoryUri, filename, mimeType, promise)
+  }
+
+  /**
+   * Copy a SAF content URI to a cache file for local playback.
+   */
+  override fun copyTtsContentUriToCache(
+    fileUri: String,
+    filename: String,
+    promise: Promise
+  ) {
+    ttsHelper.copyTtsContentUriToCache(fileUri, filename, promise)
+  }
+
+  /**
+   * Share a TTS audio file (file path or content URI).
+   */
+  override fun shareTtsAudio(fileUri: String, mimeType: String, promise: Promise) {
+    ttsHelper.shareTtsAudio(fileUri, mimeType, promise)
+  }
+
+  /**
+   * List all model folders in the assets/models directory.
+   * Scans the platform-specific model directory and returns folder names.
+   */
+  override fun listAssetModels(promise: Promise) {
+    assetHelper.listAssetModels(promise)
+  }
+
+  /**
+   * List model folders under a specific filesystem path.
+   */
+  override fun listModelsAtPath(path: String, recursive: Boolean, promise: Promise) {
+    assetHelper.listModelsAtPath(path, recursive, promise)
+  }
+
+  override fun getAssetPackPath(packName: String, promise: Promise) {
+    assetHelper.getAssetPackPath(packName, promise)
+  }
+
+  override fun listBundledArchiveAssetPaths(packName: String, promise: Promise) {
+    assetHelper.listBundledArchiveAssetPaths(packName, promise)
+  }
+
+  override fun extractTarZstFromAsset(
+    assetPath: String,
+    targetPath: String,
+    force: Boolean,
+    showNotificationsEnabled: Boolean?,
+    notificationTitle: String?,
+    notificationText: String?,
+    promise: Promise,
+  ) {
+    val notif = extractionNotificationOrNull(
+      showNotificationsEnabled,
+      notificationTitle,
+      notificationText,
+    )
+    archiveHelper.extractTarZstFromAsset(
+      reactApplicationContext,
+      assetPath,
+      targetPath,
+      force,
+      promise,
+      { bytes, total, percent ->
+        emitExtractTarZstProgress(assetPath, bytes, total, percent)
+      },
+      notif,
+    )
+  }
+
+  override fun extractTarBz2FromAsset(
+    assetPath: String,
+    targetPath: String,
+    force: Boolean,
+    showNotificationsEnabled: Boolean?,
+    notificationTitle: String?,
+    notificationText: String?,
+    promise: Promise,
+  ) {
+    val notif = extractionNotificationOrNull(
+      showNotificationsEnabled,
+      notificationTitle,
+      notificationText,
+    )
+    archiveHelper.extractTarBz2FromAsset(
+      reactApplicationContext,
+      assetPath,
+      targetPath,
+      force,
+      promise,
+      { bytes, total, percent ->
+        emitExtractProgress(assetPath, bytes, total, percent)
+      },
+      notif,
+    )
+  }
+
+  override fun readAssetFileAsUtf8(assetPath: String, promise: Promise) {
+    // Validate assetPath to prevent path traversal: reject paths containing
+    // "..", starting with "/" or "\", or containing backslashes.
+    if (assetPath.contains("..") ||
+        assetPath.startsWith("/") ||
+        assetPath.startsWith("\\") ||
+        assetPath.contains("\\")) {
+      promise.reject("ASSET_READ_ERROR", "Invalid asset path: $assetPath")
+      return
+    }
+    try {
+      val content = reactApplicationContext.assets.open(assetPath).bufferedReader().use { it.readText() }
+      promise.resolve(content)
+    } catch (e: Exception) {
+      android.util.Log.e(NAME, "Failed to read asset $assetPath: ${e.message}", e)
+      promise.reject("ASSET_READ_ERROR", "Failed to read asset $assetPath: ${e.message}", e)
+    }
+  }
+
+  companion object {
+    const val NAME = "SherpaOnnx"
+
+    @Volatile
+    private var instance: SherpaOnnxModule? = null
+
+    // Native JNI methods
+    @JvmStatic
+    private external fun nativeTestSherpaInit(): String
+
+    /** True if QNN HTP backend can be initialized (QnnBackend_create + free). */
+    @JvmStatic
+    private external fun nativeCanInitQnnHtp(): Boolean
+
+    /** True if the device has an NNAPI accelerator (GPU/DSP). Android API 29+. */
+    @JvmStatic
+    private external fun nativeHasNnapiAccelerator(sdkInt: Int): Boolean
+
+    /** Model detection for STT: returns HashMap with success, error, detectedModels, modelType, paths (for Kotlin API config). */
+    @JvmStatic
+    private external fun nativeDetectSttModel(
+      modelDir: String,
+      preferInt8: Boolean,
+      hasPreferInt8: Boolean,
+      modelType: String,
+      debug: Boolean
+    ): HashMap<String, Any>?
+
+    /** Model detection for TTS: returns HashMap with success, error, detectedModels, modelType, paths (for Kotlin API config). */
+    @JvmStatic
+    private external fun nativeDetectTtsModel(modelDir: String, modelType: String): HashMap<String, Any>?
+
+    /** Model detection for speech enhancement: returns HashMap with success, error, detectedModels, modelType, paths. */
+    @JvmStatic
+    private external fun nativeDetectEnhancementModel(modelDir: String, modelType: String): HashMap<String, Any>?
+
+    /** Convert arbitrary audio file to requested format (e.g. "mp3", "flac", "wav").
+     * outputSampleRateHz: for MP3 use 32000/44100/48000, 0 = default 44100. Ignored for WAV/FLAC.
+     * Returns empty string on success, or an error message otherwise. Requires FFmpeg prebuilts when called on Android.
+     */
+    @JvmStatic
+    private external fun nativeConvertAudioToFormat(inputPath: String, outputPath: String, format: String, outputSampleRateHz: Int): String
+
+    /** Convert any supported audio file to WAV 16 kHz mono 16-bit PCM. Returns empty string on success, error message otherwise. Requires FFmpeg prebuilts. */
+    @JvmStatic
+    private external fun nativeConvertAudioToWav16k(inputPath: String, outputPath: String): String
+
+    /**
+     * On success: [FloatArray samples, Integer sampleRate]. On error: [String message].
+     */
+    @JvmStatic
+    private external fun nativeDecodeAudioFileToFloatSamples(inputPath: String, targetSampleRateHz: Int): Array<Any>
+  }
+}
