@@ -131,6 +131,7 @@
   },
   "author": "XDcobra <xdcobra11@gmail.com> (https://github.com/XDcobra)",
   "license": "MIT",
+  "private": true,
   "bugs": {
     "url": "https://github.com/XDcobra/react-native-sherpa-onnx/issues"
   },
