@@ -109,7 +109,7 @@
     "example": "yarn workspace react-native-sherpa-onnx-example",
     "clean": "del-cli android/build example/android/build example/android/app/build example/ios/build lib",
     "download-ios-framework": "bash scripts/setup-ios-framework.sh",
-    "prepare": "bob build",
+    "prepare": "node -e \"process.exit(0)\"",
     "typecheck": "tsc",
     "lint": "eslint --ignore-pattern \"sherpa-onnx/**\" \"**/*.{js,ts,tsx}\"",
     "lint:fix": "eslint --fix --ignore-pattern \"sherpa-onnx/**\" \"**/*.{js,ts,tsx}\"",
